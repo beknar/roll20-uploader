@@ -1,0 +1,49 @@
+[
+ {
+  "slug": "page-0001",
+  "name": "Page 0001",
+  "w": 1275,
+  "h": 1613,
+  "kind": "review",
+  "detected": 16.0,
+  "measured": 14.0,
+  "confident": true,
+  "note": "SET kind TO scene / plate / manual, or skip:true. autocorrelation 16.0, line spacing 14.0",
+  "skip": true
+ },
+ {
+  "slug": "page-0023",
+  "name": "Page 0023",
+  "w": 1275,
+  "h": 1613,
+  "kind": "manual",
+  "detected": 85.0,
+  "measured": 14.0,
+  "confident": false,
+  "note": "SET kind TO scene / plate / manual, or skip:true. autocorrelation 85.0, line spacing 14.0",
+  "gridtype": "hex"
+ },
+ {
+  "slug": "page-0040",
+  "name": "Page 0040",
+  "w": 1275,
+  "h": 1613,
+  "kind": "plate",
+  "detected": 106.5,
+  "measured": 71.0,
+  "confident": false,
+  "note": "SET kind TO scene / plate / manual, or skip:true. autocorrelation 106.5, line spacing 71.0",
+  "pitch": 71
+ },
+ {
+  "slug": "page-0043",
+  "name": "Page 0043",
+  "w": 1275,
+  "h": 1613,
+  "kind": "scene",
+  "detected": 16.5,
+  "measured": 14.0,
+  "confident": false,
+  "note": "SET kind TO scene / plate / manual, or skip:true. autocorrelation 16.5, line spacing 14.0"
+ }
+]

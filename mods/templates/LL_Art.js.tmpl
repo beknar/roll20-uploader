@@ -1,0 +1,188 @@
+// ============================================================================
+//  LL_Art.js  -- portraits + default tokens  (v3)
+//
+//  v2 built a real graphic and registered it with setDefaultTokenForCharacter()
+//  instead of writing character.defaulttoken directly, which silently does not
+//  register anything.
+//
+//  v3 UNLINKS bar1. v2 set bar1_link to the sheet's hp attribute, which makes
+//  every token of that creature share one HP pool -- damage one goblin and all
+//  four drop. Unlinked bars carry plain numbers copied onto each token as it is
+//  dropped, so each one tracks its own damage. Max HP still comes from the
+//  sheet; it is read once here and baked into the default token.
+//
+//  Run AFTER !llimport has finished. Safe to re-run.
+//
+//  Commands (GM only):
+//    !llart test [name]   one character, verbose -- do this first
+//    !llart apply         all 142 (re-applies; tokens are cheap to redo)
+//    !llart status        how many have an avatar
+//    !llart probe [name]  read back what Roll20 actually stored
+//
+//  NOTE: a default token only affects tokens dragged out AFTER it is set.
+//  Delete any test tokens already on the map and drag fresh ones.
+// ============================================================================
+on('ready', function () {
+    'use strict';
+
+    var BASE = 'https://files.d20.io/images/';
+
+    // [ character name, portrait key, token key, token pixel size ]
+    var ART = [
+@@DATA@@
+    ];
+
+    function portrait(e) { return BASE + e[1] + '/max.webp'; }
+    function tokenimg(e) { return BASE + e[2] + '/thumb.webp'; }
+    function say(m) { sendChat('@@LABEL@@', '/w gm ' + m); }
+
+    function charFor(name) {
+        var c = findObjs({ _type: 'character', name: name });
+        return c.length ? c[0] : null;
+    }
+
+    // Somewhere to park the temporary graphic. Any page will do; it is removed
+    // again immediately and sits off-canvas while it exists.
+    function workPage() {
+        var p = Campaign().get('playerpageid');
+        if (p) return p;
+        var pages = findObjs({ _type: 'page' });
+        return pages.length ? pages[0].id : null;
+    }
+
+    function applyOne(e, verbose, done) {
+        var ch = charFor(e[0]);
+        if (!ch) { if (done) done('nochar'); return; }
+
+        var pageid = workPage();
+        if (!pageid) { say('no page available to build tokens on'); if (done) done('err'); return; }
+
+        try { ch.set('avatar', portrait(e)); }
+        catch (err) { if (verbose) say('avatar failed on ' + e[0] + ': ' + err.message); }
+
+        // Read max HP off the sheet, but copy it in as a NUMBER. Deliberately no
+        // bar1_link: a linked bar is shared by every token of this character.
+        var hp = findObjs({ _type: 'attribute', _characterid: ch.id, name: 'hp' })[0];
+        var hpmax = hp ? (hp.get('max') || hp.get('current')) : '';
+        var attrs = {
+            _pageid: pageid,
+            imgsrc: tokenimg(e),
+            represents: ch.id,
+            name: ch.get('name'),
+            left: -2000, top: -2000,          // off-canvas; never seen
+            width: e[3], height: e[3],
+            layer: 'objects',
+            showname: true,
+            showplayers_name: false
+        };
+        if (hpmax !== '' && hpmax !== null) {
+            attrs.bar1_value = hpmax;
+            attrs.bar1_max = hpmax;
+        }
+
+        var g;
+        try { g = createObj('graphic', attrs); }
+        catch (err) {
+            if (verbose) say('createObj failed on ' + e[0] + ': ' + err.message);
+            if (done) done('err');
+            return;
+        }
+        if (!g) {
+            if (verbose) say('createObj returned nothing for ' + e[0] +
+                             ' -- imgsrc probably rejected: ' + tokenimg(e));
+            if (done) done('err');
+            return;
+        }
+
+        try { setDefaultTokenForCharacter(ch, g); }
+        catch (err) {
+            if (verbose) say('setDefaultTokenForCharacter failed on ' + e[0] + ': ' + err.message);
+            g.remove();
+            if (done) done('err');
+            return;
+        }
+
+        // Give Roll20 a beat to copy the graphic before deleting the original.
+        setTimeout(function () {
+            try { g.remove(); } catch (err) {}
+            if (verbose) {
+                say('<b>' + e[0] + '</b>: avatar set, default token ' + e[3] + 'px' +
+                    (hpmax !== '' ? ', bar1 unlinked at ' + hpmax + '/' + hpmax
+                                  : ', <b>no hp attribute found</b>'));
+                probe(e[0]);
+            }
+            if (done) done('ok');
+        }, 400);
+    }
+
+    function probe(name) {
+        var ch = charFor(name);
+        if (!ch) { say('probe: no character named ' + name); return; }
+        ch.get('_defaulttoken', function (dt) {
+            if (!dt || dt === 'null') { say('probe <b>' + name + '</b>: <b>no default token stored</b>'); return; }
+            var parsed = null;
+            try { parsed = JSON.parse(decodeURIComponent(dt)); }
+            catch (err) { try { parsed = JSON.parse(dt); } catch (e2) {} }
+            if (!parsed) { say('probe <b>' + name + '</b>: stored, ' + dt.length + ' chars, unparseable'); return; }
+            say('probe <b>' + name + '</b>: ' + parsed.width + 'x' + parsed.height +
+                ', bar1 ' + (parsed.bar1_value || '?') + '/' + (parsed.bar1_max || '?') +
+                ', bar1_link ' + (parsed.bar1_link ? '<b>SET (wrong - should be empty)</b>' : 'empty (correct)') +
+                ', imgsrc ' + (parsed.imgsrc ? 'set' : 'EMPTY'));
+        });
+    }
+
+    function run() {
+        var i = 0, tally = { ok: 0, nochar: 0, err: 0 }, bad = [];
+        function next() {
+            if (i >= ART.length) {
+                say('<b>done.</b> ' + tally.ok + ' set | ' + tally.nochar + ' no character | ' +
+                    tally.err + ' errors' + (bad.length ? '<br>' + bad.join('<br>') : ''));
+                say('Default tokens apply only to tokens dragged out from now on. ' +
+                    'Delete any test tokens already on a map.');
+                return;
+            }
+            var e = ART[i++];
+            applyOne(e, false, function (st) {
+                tally[st]++;
+                if (st !== 'ok') bad.push(e[0] + ' (' + st + ')');
+                if (i - 25 * Math.floor(i / 25) === 0) say('progress: ' + i + '/' + ART.length);
+                setTimeout(next, 120);
+            });
+        }
+        next();
+    }
+
+    function status() {
+        var done = 0, pend = 0, gone = [];
+        ART.forEach(function (e) {
+            var ch = charFor(e[0]);
+            if (!ch) { gone.push(e[0]); return; }
+            if ((ch.get('avatar') || '').indexOf('files.d20.io') > -1) done++; else pend++;
+        });
+        say('avatars: ' + done + ' set, ' + pend + ' pending, ' + gone.length + ' not imported' +
+            (gone.length ? '<br>' + gone.slice(0, 20).join(', ') : ''));
+    }
+
+    on('chat:message', function (msg) {
+        if (msg.type !== 'api' || msg.content.indexOf('!llart') !== 0) return;
+        if (!playerIsGM(msg.playerid)) return;
+        var a = msg.content.split(/\s+/);
+        var rest = a.slice(2).join(' ');
+        switch (a[1]) {
+            case 'apply':  run(); break;
+            case 'status': status(); break;
+            case 'probe':  probe(rest || ART[0][0]); break;
+            case 'test':
+                var name = rest || ART[0][0];
+                var e = ART.filter(function (x) { return x[0].toLowerCase() === name.toLowerCase(); })[0];
+                if (!e) { say('no entry named ' + name); break; }
+                applyOne(e, true, function (st) { if (st === 'nochar') say('no character named ' + e[0]); });
+                break;
+            default:
+                say('!llart test [name] | apply | status | probe [name]');
+        }
+    });
+
+    log('LL_Art v3 ready: ' + ART.length + ' entries.');
+    say('LL_Art <b>v3</b> loaded, ' + ART.length + ' entries. Run <b>!llart test</b> first.');
+});

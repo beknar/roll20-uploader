@@ -1,0 +1,367 @@
+// ============================================================================
+//  LL_Maps.js  -- build Roll20 pages from the vault maps  (v3)
+//
+//  Creates one page per map and drops the image on the map layer.
+//
+//  TWO KINDS OF MAP, handled differently:
+//
+//  "plate"  -- a scanned book page with a printed grid. Roll20 has no grid
+//     offset: you align by SCALING the image so its printed squares land on the
+//     fixed 70px grid. So the page is sized from the image and the pitch:
+//        graphic size = image px * 70 / pitch
+//     Only plates with a pitch VERIFIED by two independent methods carry one
+//     here. Pages held back are listed by !llmaps held and are left for you to
+//     do with Roll20's Align to Grid tool.
+//
+//  "scene"  -- gridless illustration (the 40 backdrops and 28 location pieces).
+//     Nothing to align. The page is sized to the image's aspect and the grid is
+//     turned off, so tokens move freely.
+//
+//  The image URLs are your own library's, harvested from the Art Library
+//  sidebar -- the Mod API refuses any imgsrc that is not already Roll20-hosted.
+//
+//  v3. The four maps v1/v2 held back are now pushed as kind "manual": placed at
+//  NATIVE pixel size (no scaling) with the grid switched on, so Roll20's Align
+//  to Grid tool has a sane starting point. Level 5A's pitch was never resolved,
+//  the hex map gets grid_type hex, and the two Fairhill maps have no printed
+//  grid at all -- turn their grid off if you don't want one.
+//
+//  v2. createObj('page', ...) returns null -- the Mod API cannot create pages,
+//  only modify ones that already exist. v1 treated null as an error but printed
+//  nothing unless the call threw, so it failed in total silence. Two changes:
+//  every failure now reports, and there is a path that does not need to create
+//  pages at all.
+//
+//  THE WORKFLOW NOW:
+//    1. !llmaps probe        confirm whether this campaign can create pages
+//    2. make N blank pages    in the Page Toolbar (the + button). One per map.
+//    3. !llmaps adopt        claims each blank page, names it, sizes it, sets
+//                            the grid and scale, and places the map image
+//  Adopt only touches pages that are empty and still called "Untitled" (or the
+//  name you pass with `as`), so it can never overwrite a page you built.
+//
+//  Commands (GM only):
+//    !llmaps probe         test whether createObj('page') works here
+//    !llmaps adopt [n]     configure up to n blank pages (default: all pending)
+//    !llmaps pending       what still needs a page, in adopt order
+//    !llmaps test [name]   build one page, verbose
+//    !llmaps apply         build every ready page (skips ones already made)
+//    !llmaps held          list what was deliberately NOT built, and why
+//    !llmaps status        how many exist
+//    !llmaps revert        delete the pages this script created
+// ============================================================================
+on('ready', function () {
+    'use strict';
+
+    var BASE = 'https://files.d20.io/images/';
+    var SQ = 70;                       // Roll20's grid is 70px, always
+    var FEET_PER_SQUARE = 10;          // these books rule at 10ft, not 5ft
+
+    var MAPS = [
+@@DATA@@
+    ];
+
+    function img(m) { return BASE + m.key + '/thumb.webp'; }
+    function say(s) {
+        var safe = String(s).replace(/@\{/g, '(at){').replace(/\[\[/g, '[(').replace(/\]\]/g, ')]');
+        try { sendChat('@@LABEL@@', '/w gm ' + safe); }
+        catch (e) { log('LL_Maps: sendChat failed: ' + e.message); }
+    }
+    function store() {
+        if (!state.LLMAPS) state.LLMAPS = { pages: {} };
+        if (!state.LLMAPS.pages) state.LLMAPS.pages = {};
+        return state.LLMAPS;
+    }
+
+    function existingPage(name) {
+        return findObjs({ _type: 'page', name: name })[0] || null;
+    }
+
+    // Work out the page geometry for one map.
+    function geometry(m) {
+        if (m.kind === 'plate' && m.pitch) {
+            var scale = SQ / m.pitch;               // px per printed square -> 70
+            var gw = Math.round(m.w * scale);
+            var gh = Math.round(m.h * scale);
+            return { gw: gw, gh: gh,
+                     pw: Math.ceil(gw / SQ), ph: Math.ceil(gh / SQ),
+                     grid: true };
+        }
+        if (m.kind === 'manual') {
+            // Native size, grid on, nothing scaled -- you align this one by hand.
+            return { gw: m.w, gh: m.h,
+                     pw: Math.ceil(m.w / SQ), ph: Math.ceil(m.h / SQ),
+                     grid: true, gridtype: m.gridtype || 'square' };
+        }
+        // Gridless art: pick a comfortable size, keep the aspect, grid off.
+        var targetW = 25 * SQ;
+        var s = targetW / m.w;
+        var gw2 = Math.round(m.w * s), gh2 = Math.round(m.h * s);
+        return { gw: gw2, gh: gh2,
+                 pw: Math.ceil(gw2 / SQ), ph: Math.ceil(gh2 / SQ),
+                 grid: false };
+    }
+
+    function build(m, verbose) {
+        if (m.hold) return { st: 'held' };
+        if (m.kind === 'plate' && !m.pitch) return { st: 'held' };
+
+        if (existingPage(m.name)) {
+            if (verbose) say('page <b>' + m.name + '</b> already exists - skipping');
+            return { st: 'exists' };
+        }
+
+        var g = geometry(m);
+        var page;
+        try {
+            page = createObj('page', {
+                name: m.name,
+                width: g.pw, height: g.ph,
+                showgrid: g.grid,
+                snapping_increment: 1,
+                grid_opacity: g.grid ? 0.25 : 0,
+                scale_number: FEET_PER_SQUARE,
+                scale_units: 'ft',
+                background_color: '#ffffff',
+                archived: false
+            });
+        } catch (err) {
+            say('createObj(page) threw for ' + m.name + ': ' + err.message);
+            return { st: 'err' };
+        }
+        if (!page) {
+            say('<b>createObj(page) returned null</b> for ' + m.name + '.<br>' +
+                'The Mod API cannot create pages in this campaign. Make blank pages ' +
+                'in the Page Toolbar and run <b>!llmaps adopt</b> instead.');
+            return { st: 'err' };
+        }
+
+        var gr;
+        try {
+            gr = createObj('graphic', {
+                _pageid: page.id,
+                layer: 'map',
+                imgsrc: img(m),
+                name: m.name,
+                left: Math.round(g.gw / 2),
+                top: Math.round(g.gh / 2),
+                width: g.gw, height: g.gh
+            });
+        } catch (err) {
+            if (verbose) say('createObj(graphic) failed for ' + m.name + ': ' + err.message);
+            return { st: 'err' };
+        }
+        if (!gr) {
+            say('graphic rejected for ' + m.name + ' -- imgsrc ' + img(m));
+            return { st: 'err' };
+        }
+
+        store().pages[m.slug] = page.id;
+
+        if (verbose) {
+            say('<b>' + m.name + '</b><br>' +
+                (g.grid ? 'grid ON, printed pitch ' + m.pitch + 'px scaled to 70px'
+                        : 'grid OFF (gridless art)') +
+                '<br>page ' + g.pw + ' x ' + g.ph + ' squares, image ' + g.gw + ' x ' + g.gh + 'px' +
+                (g.grid ? '<br>that is ' + Math.round(g.gw/SQ) + ' x ' + Math.round(g.gh/SQ) +
+                          ' squares of map at ' + FEET_PER_SQUARE + 'ft each' : ''));
+        }
+        return { st: 'ok' };
+    }
+
+    // Everything build() does except conjuring the page: point it at an existing
+    // one. This is the path that actually works.
+    function configure(page, m, verbose) {
+        var g = geometry(m);
+        try {
+            var props = {
+                name: m.name,
+                width: g.pw, height: g.ph,
+                showgrid: g.grid,
+                snapping_increment: 1,
+                grid_opacity: g.grid ? 0.25 : 0,
+                scale_number: FEET_PER_SQUARE,
+                scale_units: 'ft',
+                archived: false
+            };
+            if (g.gridtype) props.grid_type = g.gridtype;
+            page.set(props);
+        } catch (err) {
+            say('page.set failed for ' + m.name + ': ' + err.message);
+            return { st: 'err' };
+        }
+        var gr = createObj('graphic', {
+            _pageid: page.id, layer: 'map', imgsrc: img(m), name: m.name,
+            left: Math.round(g.gw / 2), top: Math.round(g.gh / 2),
+            width: g.gw, height: g.gh
+        });
+        if (!gr) { say('graphic rejected for ' + m.name + ' -- imgsrc ' + img(m)); return { st: 'err' }; }
+        store().pages[m.slug] = page.id;
+        if (verbose) {
+            say('<b>' + m.name + '</b> configured on an existing page<br>' +
+                (m.kind === 'manual'
+                   ? 'grid ON (' + (g.gridtype || 'square') + '), image at NATIVE size - align by hand'
+                   : g.grid ? 'grid ON, pitch ' + m.pitch + 'px -> 70px' : 'grid OFF') +
+                '<br>page ' + g.pw + ' x ' + g.ph + ' squares, image ' + g.gw + ' x ' + g.gh + 'px');
+        }
+        return { st: 'ok' };
+    }
+
+    function wanted() {
+        return MAPS.filter(function (m) {
+            if (m.hold) return false;
+            if (m.kind === 'plate' && !m.pitch) return false;
+            return !existingPage(m.name);   // "manual" maps are included
+        });
+    }
+
+    // A page is fair game only if it is untouched: default name, nothing on it.
+    function blankPages(label) {
+        var re = label ? new RegExp('^' + label, 'i') : /^untitled/i;
+        return findObjs({ _type: 'page' }).filter(function (p) {
+            if (p.get('archived')) return false;
+            if (!re.test(String(p.get('name') || '').trim())) return false;
+            var stuff = findObjs({ _type: 'graphic', _pageid: p.id }).length +
+                        findObjs({ _type: 'path', _pageid: p.id }).length +
+                        findObjs({ _type: 'text', _pageid: p.id }).length;
+            return stuff === 0;
+        });
+    }
+
+    function adopt(limit, label) {
+        var todo = wanted();
+        var blanks = blankPages(label);
+        if (!blanks.length) {
+            say('no blank pages found. Make some with the <b>+</b> in the Page Toolbar ' +
+                '(leave them named "Untitled" and empty), then run this again.<br>' +
+                todo.length + ' maps are waiting.');
+            return;
+        }
+        var n = Math.min(limit || todo.length, todo.length, blanks.length);
+        var i = 0, ok = 0, bad = 0;
+        function step() {
+            var end = Math.min(i + 3, n);
+            for (; i < end; i++) {
+                var r = configure(blanks[i], todo[i], false);
+                if (r.st === 'ok') ok++; else bad++;
+            }
+            if (i < n) { setTimeout(step, 400); return; }
+            var left = wanted().length;
+            say('<b>adopted ' + ok + ' page(s)</b>' + (bad ? ', ' + bad + ' failed' : '') +
+                '.<br>' + left + ' maps still waiting' +
+                (left ? ' - make ' + left + ' more blank pages and run !llmaps adopt again.' : ' - all done.'));
+        }
+        step();
+    }
+
+    function probe() {
+        var p = null, threw = null;
+        try { p = createObj('page', { name: 'LL probe - delete me' }); }
+        catch (e) { threw = e.message; }
+        if (threw) { say('createObj(page) <b>threw</b>: ' + threw + '<br>Use the adopt workflow.'); return; }
+        if (!p) {
+            say('createObj(page) returned <b>null</b> - this API cannot create pages.<br>' +
+                'Make blank pages in the Page Toolbar, then <b>!llmaps adopt</b>.');
+            return;
+        }
+        say('createObj(page) <b>worked</b> - page "LL probe - delete me" exists. ' +
+            'Delete it, then <b>!llmaps apply</b> will work directly.');
+    }
+
+    function pending() {
+        var w = wanted();
+        say(w.length + ' maps need a page. Next up:<br>' +
+            w.slice(0, 12).map(function (m, i) { return (i+1) + '. ' + m.name; }).join('<br>') +
+            (w.length > 12 ? '<br>... and ' + (w.length - 12) + ' more' : '') +
+            '<br>Blank pages available right now: ' + blankPages().length);
+    }
+
+    function apply() {
+        var i = 0, t = { ok: 0, exists: 0, held: 0, err: 0 }, bad = [];
+        function step() {
+            var end = Math.min(i + 3, MAPS.length);
+            for (; i < end; i++) {
+                var r = build(MAPS[i], false);
+                t[r.st]++;
+                if (r.st === 'err') bad.push(MAPS[i].name);
+            }
+            if (i < MAPS.length) {
+                if (i - 20 * Math.floor(i / 20) === 0) say('progress: ' + i + '/' + MAPS.length);
+                setTimeout(step, 400);
+                return;
+            }
+            say('<b>done.</b> ' + t.ok + ' pages built | ' + t.exists + ' already existed | ' +
+                t.held + ' held back (see <b>!llmaps held</b>) | ' + t.err + ' errors' +
+                (bad.length ? '<br>' + bad.join('<br>') : ''));
+        }
+        step();
+    }
+
+    function held() {
+        var lines = MAPS.filter(function (m) { return m.hold || (m.kind === 'plate' && !m.pitch); })
+                        .map(function (m) { return '<b>' + m.name + '</b> - ' + (m.hold || 'no verified pitch'); });
+        var man = MAPS.filter(function (m) { return m.kind === 'manual'; })
+                      .map(function (m) { return '<b>' + m.name + '</b>'; });
+        say((lines.length ? 'held back (' + lines.length + '):<br>' + lines.join('<br>') + '<br><br>' : '') +
+            'placed at native size for hand alignment (' + man.length + '):<br>' + man.join('<br>'));
+    }
+
+    function status() {
+        var built = 0, missing = [];
+        MAPS.forEach(function (m) {
+            if (m.hold || (m.kind === 'plate' && !m.pitch)) return;
+            if (existingPage(m.name)) built++; else missing.push(m.name);
+        });
+        say('pages: ' + built + ' built, ' + missing.length + ' still to build' +
+            (missing.length && missing.length < 15 ? '<br>' + missing.join(', ') : ''));
+    }
+
+    function revert() {
+        var s = store(), n = 0;
+        Object.keys(s.pages).forEach(function (slug) {
+            var p = getObj('page', s.pages[slug]);
+            if (p) { p.set('archived', true); n++; }
+        });
+        say('archived ' + n + ' pages this script created. Roll20 will not let a Mod ' +
+            'delete a page outright, so they are archived - remove them from the page ' +
+            'toolbar if you want them gone for good.');
+    }
+
+    on('chat:message', function (msg) {
+        if (msg.type !== 'api' || msg.content.indexOf('!llmaps') !== 0) return;
+        if (!playerIsGM(msg.playerid)) return;
+        var a = msg.content.split(/\s+/), rest = a.slice(2).join(' ');
+        try {
+            switch (a[1]) {
+                case 'apply':  apply(); break;
+                case 'probe':  probe(); break;
+                case 'pending': pending(); break;
+                case 'adopt':
+                    var lim = parseInt(a[2], 10);
+                    adopt(isNaN(lim) ? 0 : lim, a[3] === 'as' ? a[4] : null);
+                    break;
+                case 'held':   held(); break;
+                case 'status': status(); break;
+                case 'revert': revert(); break;
+                case 'test':
+                    var want = rest || 'Tomb of Abysthor - Entrance Level';
+                    var m = MAPS.filter(function (x) {
+                        return x.name.toLowerCase() === want.toLowerCase() ||
+                               x.slug.toLowerCase() === want.toLowerCase();
+                    })[0];
+                    if (!m) { say('no map called ' + want); break; }
+                    var r = build(m, true);
+                    if (r.st === 'held') say(m.name + ' is held back on purpose - see !llmaps held');
+                    break;
+                default:
+                    say('!llmaps probe | pending | adopt [n] | test [name] | apply | held | status | revert');
+            }
+        } catch (err) {
+            log('LL_Maps ERROR: ' + err.message); log(err.stack);
+            say('<b>error</b>: ' + String(err.message).slice(0, 200));
+        }
+    });
+
+    log('LL_Maps v3 ready: ' + MAPS.length + ' maps.');
+    say('LL_Maps <b>v3</b> loaded, ' + MAPS.length + ' maps. <b>!llmaps pending</b> to see what is left.');
+});

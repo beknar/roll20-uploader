@@ -1,0 +1,25 @@
+{
+  "vault": "/absolute/path/to/your/obsidian/vault",
+  "campaign_label": "My Campaign",
+  "out": "build",
+
+  "attachments": {
+    "creatures": "_attachments/creatures",
+    "characters": "_attachments/characters",
+    "locations": "_attachments/locations",
+    "maps": "_attachments/maps",
+    "maps_generic": "_attachments/maps/generic"
+  },
+
+  "art": {
+    "portrait_suffix": "",
+    "token_suffix": "-token-128"
+  },
+
+  "maps": {
+    "feet_per_square": 10,
+    "scene_width_squares": 25
+  },
+
+  "srd_actors": null
+}

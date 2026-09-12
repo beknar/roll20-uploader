@@ -1,0 +1,239 @@
+// ============================================================================
+//  LL_Spells.js  -- populate the spell section for NPC casters (v3)
+//
+//  Parsed out of the vault's Spellcasting / Innate Spellcasting text and
+//  written into the sheet's real spell section. Section and field names were
+//  read off the live 5e sheet, not guessed: repeating_spell-cantrip and
+//  repeating_spell-1 .. -9, with spellname / spelllevel / spellprepared /
+//  spell_innate per row.
+//
+//  Also repairs the slot counts. Seven casters (Dark Natasha, Gremag, Illarda,
+//  Kath, Kerik, Sordria, Yandarrel) were built by cloning an SRD base and came
+//  through with every lvlN_slots_total at 0; their real slots are set here.
+//  Those same seven carried their spell list twice -- once from the vault and
+//  once from the SRD base -- so lists are deduped to the union.
+//
+//  Spell NAMES and LEVELS only. No descriptions: the vault has none, and the
+//  local SRD source carries items and monsters but no spells. Clicking a spell
+//  shows its name and level; look the text up elsewhere. Slot tracking works.
+//
+//  v3: writes the correct school per spell and collapses the row. Leaving
+//  spellschool blank made the sheet default that dropdown to its first option,
+//  so every spell was silently filed as Abjuration; and a row with no
+//  details-flag renders fully expanded. Re-running updates rows already there.
+//
+//  Commands (GM only):
+//    !llspells test [name]   one caster, verbose
+//    !llspells apply         all 24
+//    !llspells status        what is populated
+//    !llspells revert        delete every row this script created
+// ============================================================================
+on('ready', function () {
+    'use strict';
+
+    // { n: name, dc, atk, ab, slots: {level: total}, sp: [[level, spell, innateUse]] }
+    var CASTERS = [
+@@DATA@@
+    ];
+
+    function say(m) {
+        var safe = String(m).replace(/@\{/g, '(at){').replace(/\[\[/g, '[(').replace(/\]\]/g, ')]');
+        try { sendChat('@@LABEL@@', '/w gm ' + safe); }
+        catch (e) { log('LL_Spells: sendChat failed: ' + e.message); }
+    }
+    function store() {
+        if (!state.LLSPELLS) state.LLSPELLS = { made: [] };
+        if (!state.LLSPELLS.made) state.LLSPELLS.made = [];
+        return state.LLSPELLS;
+    }
+
+    // generateRowID() is not exposed in the Mod sandbox, so build IDs the same
+    // way the Roll20 client does: 20 chars from its base64 alphabet, time-ordered
+    // in the first 8 so rows sort in creation order. Underscores are mapped to
+    // dashes because attribute names are split on "_".
+    var ROWCHARS = '-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz';
+    var rowLast = 0, rowRand = [];
+    function rowID() {
+        var now = (new Date()).getTime(), dup = (now === rowLast);
+        rowLast = now;
+        var head = new Array(8), i;
+        for (i = 7; i >= 0; i--) { head[i] = ROWCHARS.charAt(now % 64); now = Math.floor(now / 64); }
+        var id = head.join('');
+        if (dup) {
+            for (i = 11; i >= 0 && rowRand[i] === 63; i--) rowRand[i] = 0;
+            rowRand[i]++;
+        } else {
+            for (i = 0; i < 12; i++) rowRand[i] = Math.floor(64 * Math.random());
+        }
+        for (i = 0; i < 12; i++) id += ROWCHARS.charAt(rowRand[i]);
+        return id.replace(/_/g, '-');
+    }
+
+    // The generator can repeat inside a single millisecond, and a repeated row ID
+    // would merge two spells into one row. Cheap insurance: never hand back an ID
+    // already used this session.
+    var usedRows = {};
+    function uniqueRowID() {
+        for (var i = 0; i < 50; i++) {
+            var id = rowID();
+            if (!usedRows[id]) { usedRows[id] = true; return id; }
+        }
+        return rowID() + Math.floor(Math.random() * 9);
+    }
+
+    function setAttr(charid, name, value) {
+        var a = findObjs({ _type: 'attribute', _characterid: charid, name: name })[0];
+        if (a) { a.set('current', value); return a; }
+        a = createObj('attribute', { _characterid: charid, name: name, current: value, max: '' });
+        return a;
+    }
+
+    // Rows this script creates are remembered so revert can remove them.
+    function makeRow(charid, section, fields) {
+        var rid = uniqueRowID();
+        var s = store();
+        Object.keys(fields).forEach(function (k) {
+            var a = createObj('attribute', {
+                _characterid: charid,
+                name: 'repeating_' + section + '_' + rid + '_' + k,
+                current: fields[k], max: ''
+            });
+            if (a) s.made.push(a.id);
+        });
+        return rid;
+    }
+
+    function existingNames(charid, section) {
+        var pre = 'repeating_' + section + '_', have = {};
+        findObjs({ _type: 'attribute', _characterid: charid }).forEach(function (a) {
+            var n = a.get('name');
+            if (n.indexOf(pre) === 0 && n.slice(-10) === '_spellname') {
+                have[String(a.get('current')).toLowerCase()] = n.slice(0, -10);
+            }
+        });
+        return have;
+    }
+
+    function applyOne(c, verbose) {
+        var ch = findObjs({ _type: 'character', name: c.n })[0];
+        if (!ch) return { st: 'nochar' };
+
+        setAttr(ch.id, 'npcspellcastingflag', '1');
+        if (c.ab) setAttr(ch.id, 'spellcasting_ability', c.ab);
+        if (c.dc) setAttr(ch.id, 'spell_save_dc', String(c.dc));
+        if (c.atk) setAttr(ch.id, 'spell_attack_bonus', String(c.atk));
+        for (var L = 1; L <= 9; L++) {
+            setAttr(ch.id, 'lvl' + L + '_slots_total', String(c.slots[String(L)] || 0));
+        }
+
+        var added = 0, skipped = 0, cache = {};
+        c.sp.forEach(function (row) {
+            var lvl = row[0], name = row[1], innate = row[2];
+            var section = 'spell-' + lvl;              // spell-cantrip, spell-1 .. spell-9
+            if (!cache[section]) cache[section] = existingNames(ch.id, section);
+            var school = row[3] || '';
+            var existing = cache[section][name.toLowerCase()];
+            if (existing) {
+                // Already present: correct the school and collapse it.
+                if (school) setAttr(ch.id, existing + '_spellschool', school);
+                setAttr(ch.id, existing + '_details-flag', '0');
+                skipped++;
+                return;
+            }
+            var f = { spellname: name, spelllevel: lvl, spellprepared: '1',
+                      'details-flag': '0' };
+            if (school) f.spellschool = school;
+            if (innate) f.spell_innate = innate;
+            makeRow(ch.id, section, f);
+            cache[section][name.toLowerCase()] = 'made';
+            added++;
+        });
+
+        if (verbose) {
+            say('<b>' + c.n + '</b>: ' + added + ' added, ' + skipped + ' updated in place.' +
+                '<br>save DC ' + c.dc + ', attack +' + c.atk + ', ability ' + (c.ab || '-') +
+                '<br>slots: ' + (Object.keys(c.slots).length
+                    ? Object.keys(c.slots).map(function (k) { return k + ':' + c.slots[k]; }).join('  ')
+                    : 'none (innate caster)'));
+        }
+        return { st: 'ok', added: added, skipped: skipped };
+    }
+
+    function apply() {
+        var i = 0, add = 0, skip = 0, miss = [];
+        function step() {
+            var end = Math.min(i + 2, CASTERS.length);
+            for (; i < end; i++) {
+                var r = applyOne(CASTERS[i], false);
+                if (r.st === 'nochar') { miss.push(CASTERS[i].n); continue; }
+                add += r.added; skip += r.skipped;
+            }
+            if (i < CASTERS.length) { setTimeout(step, 250); return; }
+            say('<b>done.</b> ' + add + ' spell rows added, ' + skip + ' updated in place' +
+                (miss.length ? '<br>no character for: ' + miss.join(', ') : '') +
+                '<br>Open a caster and check the Spells tab.');
+        }
+        step();
+    }
+
+    function status() {
+        var done = 0, empty = [], miss = 0;
+        CASTERS.forEach(function (c) {
+            var ch = findObjs({ _type: 'character', name: c.n })[0];
+            if (!ch) { miss++; return; }
+            var n = 0;
+            findObjs({ _type: 'attribute', _characterid: ch.id }).forEach(function (a) {
+                if (a.get('name').indexOf('repeating_spell-') === 0 &&
+                    a.get('name').slice(-10) === '_spellname') n++;
+            });
+            if (n) done++; else empty.push(c.n);
+        });
+        say('casters with spells on the sheet: ' + done + '/' + CASTERS.length +
+            (miss ? ' | ' + miss + ' not imported' : '') +
+            (empty.length ? '<br>still empty: ' + empty.join(', ') : '') +
+            ' | rows created by this script: ' + store().made.length);
+    }
+
+    function revert() {
+        var s = store(), n = 0;
+        s.made.forEach(function (id) {
+            var a = getObj('attribute', id);
+            if (a) { a.remove(); n++; }
+        });
+        s.made = [];
+        say('removed ' + n + ' attributes this script created. Slot totals and DCs were ' +
+            'overwritten in place and are not restored.');
+    }
+
+    on('chat:message', function (msg) {
+        if (msg.type !== 'api' || msg.content.indexOf('!llspells') !== 0) return;
+        if (!playerIsGM(msg.playerid)) return;
+        var a = msg.content.split(/\s+/);
+        var rest = a.slice(2).join(' ');
+        try {
+            switch (a[1]) {
+                case 'apply':  apply(); break;
+                case 'status': status(); break;
+                case 'revert': revert(); break;
+                case 'test':
+                    var name = rest || 'Acolyte of Orcus';
+                    var c = CASTERS.filter(function (x) {
+                        return x.n.toLowerCase() === name.toLowerCase();
+                    })[0];
+                    if (!c) { say('no caster named ' + name + '. Casters: ' +
+                                  CASTERS.map(function (x) { return x.n; }).join(', ')); break; }
+                    var r = applyOne(c, true);
+                    if (r.st === 'nochar') say('no character named ' + c.n);
+                    break;
+                default:
+                    say('!llspells test [name] | apply | status | revert');
+            }
+        } catch (err) {
+            log('LL_Spells ERROR: ' + err.message); log(err.stack);
+            say('<b>error</b>: ' + String(err.message).slice(0, 200));
+        }
+    });
+
+    log('LL_Spells v3 ready: ' + CASTERS.length + ' casters.');
+    say('LL_Spells <b>v3</b> loaded, ' + CASTERS.length + ' casters. Run <b>!llspells test</b> first.');
+});
