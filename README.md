@@ -17,6 +17,8 @@ and scale all come from `config.json`.
 | `LL_Fix.js` | Repairs the token action macros the importer leaves broken | — |
 | `LL_Art.js` | Sets each character's avatar and default token | art uploaded, URLs harvested |
 | `LL_Spells.js` | Fills the sheet's spell section and slot totals | — |
+| `LL_SpellData.js` | Fills in the rest of each spell row: text, properties, and roll fields | a local 5etools `data/spells` |
+| `LL_SpellAtk.js` | Token-action buttons for the spells that need an attack roll | `LL_SpellData.js` run first |
 | `LL_Maps.js` | Configures pages and places map images | art uploaded, blank pages made |
 
 ## The shape of it

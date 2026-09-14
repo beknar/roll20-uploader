@@ -1,0 +1,198 @@
+/* LL_SpellAtk.js  --  @@LABEL@@
+ * Gives every NPC spell that needs an attack roll its own token action, so the
+ * spell can be rolled from the token without opening the sheet.
+ *
+ * Only spells whose row has spellattack = Ranged or Melee get a button. Save-based
+ * spells and healing are left alone - there is no attack roll to make.
+ *
+ * The macro rolls @{spell_attack_bonus} from the caster's own sheet and prints the
+ * spell's damage, using the same npcfullatk template the NPC weapon actions use.
+ *
+ * Build: @@VERSION@@
+ *
+ * Commands (GM only):
+ *   !llspellatk ping     - confirm it loaded
+ *   !llspellatk report   - list what it would create, change nothing
+ *   !llspellatk test     - one caster only
+ *   !llspellatk run      - all casters
+ *   !llspellatk revert   - delete only the abilities this script created
+ */
+on('ready', function () {
+    'use strict';
+
+    var CASTERS = @@CASTERS@@;
+
+    function say(m) {
+        var safe = String(m).replace(/@\{/g, '(at){').replace(/\[\[/g, '[(')
+                            .replace(/\]\]/g, ')]').replace(/\{\{/g, '{(')
+                            .replace(/\}\}/g, ')}');
+        try { sendChat('@@LABEL@@', '/w gm ' + safe); }
+        catch (e) { log('sendChat failed: ' + e.message + ' || ' + safe); }
+    }
+
+    function rowsFor(charid) {
+        var rows = {};
+        findObjs({ _type: 'attribute', _characterid: charid }).forEach(function (a) {
+            /* Row ids never contain an underscore (Roll20's generateRowID swaps
+               them for dashes), so excluding it here keeps the field name
+               unambiguous - allowing it lets the greedy id swallow the field. */
+            var m = String(a.get('name')).match(
+                /^repeating_(spell-(?:cantrip|[1-9]))_(-[A-Za-z0-9-]+)_(.+)$/);
+            if (!m) return;
+            var k = m[1] + '|' + m[2];
+            rows[k] = rows[k] || { sec: m[1] };
+            rows[k][m[3]] = String(a.get('current'));
+        });
+        return rows;
+    }
+
+    function attackSpells(charid) {
+        var out = [];
+        var rows = rowsFor(charid);
+        Object.keys(rows).forEach(function (k) {
+            var r = rows[k];
+            if (!r.spellname) return;
+            if (r.spellattack !== 'Ranged' && r.spellattack !== 'Melee') return;
+            out.push(r);
+        });
+        out.sort(function (a, b) { return a.spellname.localeCompare(b.spellname); });
+        return out;
+    }
+
+    /* Built to match the working NPC weapon actions on this sheet:
+       npcfullatk, r1/@{rtype} for the attack roll, dmg1/dmg1type for damage. */
+    function macro(r) {
+        var lvl = (r.spelllevel === 'cantrip') ? 'Cantrip' : ('Level ' + r.spelllevel);
+        var m = '@{wtype}&{template:npcfullatk} {{attack=1}} @{npc_name_flag}' +
+                ' {{rname=' + r.spellname + '}}' +
+                ' {{rnamec=' + r.spellname + '}}' +
+                ' {{r1=[[@{d20}+(@{spell_attack_bonus}+0)]]}}' +
+                ' @{rtype}+(@{spell_attack_bonus}+0)]]}}';
+        if (r.spelldamage) {
+            m += ' {{damage=1}} {{dmg1flag=1}}' +
+                 ' {{dmg1=[[' + r.spelldamage + ']]}}' +
+                 ' {{dmg1type=' + (r.spelldamagetype || '') + '}}';
+            if (r.spelldamage2) {
+                m += ' {{dmg2flag=1}} {{dmg2=[[' + r.spelldamage2 + ']]}}' +
+                     ' {{dmg2type=' + (r.spelldamagetype2 || '') + '}}';
+            }
+        }
+        m += ' {{description=' + lvl +
+             (r.spellrange ? ', ' + r.spellrange : '') +
+             (r.spellsave ? ', ' + r.spellsave + ' save' : '') +
+             '.}} @{charname_output}';
+        return m;
+    }
+
+    function doCaster(ch, stats) {
+        var nm = ch.get('name');
+        var spells = attackSpells(ch.id);
+        if (!spells.length) { stats.skipped++; return null; }
+
+        var have = {};
+        findObjs({ _type: 'ability', _characterid: ch.id }).forEach(function (a) {
+            have[a.get('name')] = a;
+        });
+
+        var made = 0, upd = 0;
+        spells.forEach(function (r) {
+            var action = macro(r);
+            var ab = have[r.spellname];
+            if (ab) {
+                if (ab.get('action') !== action) { ab.set('action', action); upd++; }
+                if (!ab.get('istokenaction')) ab.set('istokenaction', true);
+            } else {
+                createObj('ability', {
+                    _characterid: ch.id, name: r.spellname,
+                    action: action, istokenaction: true
+                });
+                made++;
+            }
+        });
+        stats.made += made; stats.upd += upd; stats.casters++;
+        return nm + ': ' + made + ' new, ' + upd + ' updated (' +
+               spells.map(function (s) { return s.spellname; }).join(', ') + ')';
+    }
+
+    function run(list, label) {
+        var stats = { made: 0, upd: 0, casters: 0, skipped: 0 }, lines = [], i = 0;
+        function step() {
+            if (i >= list.length) {
+                say('<b>' + label + ' complete.</b> ' + stats.made + ' button(s) created, ' +
+                    stats.upd + ' updated, across ' + stats.casters + ' caster(s). ' +
+                    stats.skipped + ' had no attack-roll spells.');
+                lines.forEach(function (l) { say(l); });
+                return;
+            }
+            var ch = findObjs({ _type: 'character', name: list[i++] })[0];
+            if (ch) {
+                try { var l = doCaster(ch, stats); if (l) lines.push(l); }
+                catch (e) { lines.push(ch.get('name') + ': ERROR ' + e.message); }
+            }
+            setTimeout(step, 120);
+        }
+        step();
+    }
+
+    on('chat:message', function (msg) {
+        if (msg.type !== 'api' || !/^!llspellatk\b/i.test(msg.content)) return;
+        if (!playerIsGM(msg.playerid)) return;
+        var arg = (msg.content.split(/\s+/)[1] || 'help').toLowerCase();
+
+        if (arg === 'ping') {
+            say('pong. build @@VERSION@@ - watching ' + CASTERS.length + ' caster(s).');
+            return;
+        }
+        if (arg === 'report') {
+            var n = 0, withAny = 0;
+            CASTERS.forEach(function (name) {
+                var ch = findObjs({ _type: 'character', name: name })[0];
+                if (!ch) { say(name + ': NOT FOUND'); return; }
+                var s = attackSpells(ch.id);
+                if (!s.length) return;
+                withAny++; n += s.length;
+                say(name + ': ' + s.length + ' button(s) - ' +
+                    s.map(function (x) {
+                        return x.spellname + ' [' + x.spellattack +
+                               (x.spelldamage ? ' ' + x.spelldamage + ' ' + x.spelldamagetype : ' no damage') + ']';
+                    }).join(', '));
+            });
+            say('<b>Total:</b> ' + n + ' button(s) across ' + withAny + ' caster(s). Nothing changed.');
+            return;
+        }
+        if (arg === 'revert') {
+            var gone = 0;
+            CASTERS.forEach(function (name) {
+                var ch = findObjs({ _type: 'character', name: name })[0];
+                if (!ch) return;
+                var mine = {};
+                attackSpells(ch.id).forEach(function (r) { mine[r.spellname] = 1; });
+                findObjs({ _type: 'ability', _characterid: ch.id }).forEach(function (a) {
+                    /* ours = named after one of this caster's attack spells and
+                       built from our template; hand-made abilities are untouched */
+                    if (mine[a.get('name')] &&
+                        String(a.get('action')).indexOf('spell_attack_bonus') > -1) {
+                        a.remove(); gone++;
+                    }
+                });
+            });
+            say('removed ' + gone + ' ability/abilities created by this script.');
+            return;
+        }
+        if (arg === 'test') {
+            var pick = null;
+            for (var t = 0; t < CASTERS.length && !pick; t++) {
+                var cc = findObjs({ _type: 'character', name: CASTERS[t] })[0];
+                if (cc && attackSpells(cc.id).length) pick = CASTERS[t];
+            }
+            if (!pick) { say('no caster has an attack-roll spell.'); return; }
+            say('testing on ' + pick + '.');
+            run([pick], 'Test');
+            return;
+        }
+        if (arg === 'run') { run(CASTERS, 'Spell attack buttons'); return; }
+        say('usage: !llspellatk ping | report | test | run | revert');
+    });
+
+    log('LL_SpellAtk build @@VERSION@@ ready: ' + CASTERS.length + ' casters.');
+});

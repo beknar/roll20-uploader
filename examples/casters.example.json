@@ -1,0 +1,34 @@
+{
+  "_comment": [
+    "Casters whose spell rows should be filled in, and the spells to bake into",
+    "the payload. The Mod script matches rows by spell name at run time, so this",
+    "spell list only decides what ends up in the file - extra names are harmless.",
+    "",
+    "'innate' names a subset of 'casters' whose stat block says Innate",
+    "Spellcasting rather than Spellcasting; their rows get the sheet's small grey",
+    "innate marker next to the spell name.",
+    "",
+    "'aliases' maps a Roll20 spell name onto its 5etools name where the two differ."
+  ],
+
+  "casters": [
+    "Example Priest",
+    "Example Archmage"
+  ],
+
+  "innate": [
+    "Example Archmage"
+  ],
+
+  "aliases": {
+    "acid arrow": "melf's acid arrow"
+  },
+
+  "spells": [
+    "Bless",
+    "Cure Wounds",
+    "Fireball",
+    "Guiding Bolt",
+    "Sacred Flame"
+  ]
+}

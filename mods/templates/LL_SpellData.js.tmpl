@@ -1,0 +1,155 @@
+/* LL_SpellData.js  --  Lost Lands / Stoneheart Valley
+ * Fills in the full spell-row data on NPC spellcaster sheets:
+ * description, ritual, casting time, range, components, concentration,
+ * duration, spellcasting ability, innate marker, and the roll fields
+ * (output, attack, damage, type, healing, ability mod, cantrip progression).
+ *
+ * Spell text and properties are rendered from the 5etools dataset (PHB/XGE, 5e 2014).
+ *
+ * Build: @@VERSION@@
+ * (!llspelldata ping reports this, so you can confirm which build is loaded.)
+ *
+ * Commands (GM only):
+ *   !llspelldata ping    - confirm the script loaded and report what it can see
+ *   !llspelldata test    - run against one caster only (Abysthor)
+ *   !llspelldata run     - run against all NPC casters
+ *   !llspelldata report  - list casters and how many rows each has, change nothing
+ */
+on('ready', function () {
+    'use strict';
+
+    var CASTERS = @@CASTERS@@;
+    var INNATE  = @@INNATE@@;
+    var ABIL    = { str:'strength', dex:'dexterity', con:'constitution',
+                    int:'intelligence', wis:'wisdom', cha:'charisma' };
+    var FIELDS  = @@FIELDS@@;
+    var SPELLS  = @@DATA@@;
+
+    /* sendChat blows up on raw macro syntax - defang everything before it goes out. */
+    function say(m) {
+        var safe = String(m).replace(/@\{/g, '(at){').replace(/\[\[/g, '[(')
+                            .replace(/\]\]/g, ')]').replace(/\{\{/g, '{(')
+                            .replace(/\}\}/g, ')}');
+        try { sendChat('Lost Lands', '/w gm ' + safe); }
+        catch (e) { log('sendChat failed: ' + e.message + ' || ' + safe); }
+    }
+
+    function key(n) { return String(n || '').toLowerCase().replace(/[^a-z0-9]/g, ''); }
+
+    function attrMap(charid) {
+        var m = {};
+        findObjs({ _type: 'attribute', _characterid: charid }).forEach(function (a) {
+            m[a.get('name')] = a;
+        });
+        return m;
+    }
+
+    function setAttr(charid, map, name, value) {
+        var a = map[name];
+        if (a) { if (String(a.get('current')) !== String(value)) a.set('current', value); return 0; }
+        map[name] = createObj('attribute', { _characterid: charid, name: name, current: value, max: '' });
+        return 1;
+    }
+
+    function doCaster(ch, stats) {
+        var id = ch.id, nm = ch.get('name');
+        var map = attrMap(id);
+
+        var abKey = map['spellcasting_ability'] ? String(map['spellcasting_ability'].get('current')).toLowerCase() : '';
+        abKey = abKey.replace(/[^a-z]/g, '').slice(0, 3);
+        var abFull = ABIL[abKey] || '';
+        var abValue = abFull ? '@{' + abFull + '_mod}+' : 'spell';
+        var innateVal = INNATE.indexOf(nm) > -1 ? 'innate' : '';
+        var align = map['npc_alignment'] ? String(map['npc_alignment'].get('current')) : '';
+        var isEvil = /evil/i.test(align);
+
+        var rows = {};
+        Object.keys(map).forEach(function (k) {
+            var m = k.match(/^repeating_(spell-(?:cantrip|[1-9]))_(-[A-Za-z0-9_-]+)_spellname$/);
+            if (m) rows[m[1] + '_' + m[2]] = { sec: m[1], rid: m[2], name: String(map[k].get('current')) };
+        });
+
+        var done = 0, miss = [];
+        Object.keys(rows).forEach(function (rk) {
+            var row = rows[rk];
+            var sp = SPELLS[key(row.name)];
+            if (!sp) { miss.push(row.name); return; }
+            var pre = 'repeating_' + row.sec + '_' + row.rid + '_';
+            FIELDS.forEach(function (f) {
+                var v = sp[f];
+                /* Spirit Guardians and friends: the damage type follows the caster's
+                   alignment, so resolve it against this sheet rather than guessing. */
+                if (f === 'spelldamagetype' && sp.alt_evil_damagetype && isEvil) {
+                    v = sp.alt_evil_damagetype;
+                }
+                setAttr(id, map, pre + f, v);
+            });
+            setAttr(id, map, pre + 'spell_ability', abValue);
+            setAttr(id, map, pre + 'innate', innateVal);
+            if (sp.spelllevel !== 'cantrip') setAttr(id, map, pre + 'spellprepared', '1');
+            done++;
+        });
+
+        stats.rows += done;
+        stats.missing = stats.missing.concat(miss);
+        return nm + ': ' + done + ' row(s)' + (miss.length ? ', UNMATCHED: ' + miss.join(', ') : '');
+    }
+
+    function run(list, label) {
+        var stats = { rows: 0, missing: [] };
+        var lines = [];
+        var i = 0;
+        function step() {
+            if (i >= list.length) {
+                say('<b>' + label + ' complete.</b> ' + list.length + ' caster(s), ' + stats.rows + ' spell row(s) updated.');
+                if (stats.missing.length) {
+                    var u = stats.missing.filter(function (v, ix, s) { return s.indexOf(v) === ix; });
+                    say('Not in the spell table (' + u.length + '): ' + u.join(', '));
+                }
+                lines.forEach(function (l) { say(l); });
+                return;
+            }
+            var nm = list[i++];
+            var ch = findObjs({ _type: 'character', name: nm })[0];
+            if (!ch) { lines.push(nm + ': CHARACTER NOT FOUND'); setTimeout(step, 60); return; }
+            try { lines.push(doCaster(ch, stats)); }
+            catch (e) { lines.push(nm + ': ERROR ' + e.message); }
+            setTimeout(step, 120);
+        }
+        step();
+    }
+
+    on('chat:message', function (msg) {
+        if (msg.type !== 'api' || !/^!llspelldata\b/i.test(msg.content)) return;
+        if (!playerIsGM(msg.playerid)) return;
+        var arg = (msg.content.split(/\s+/)[1] || 'help').toLowerCase();
+
+        if (arg === 'ping') {
+            var seen = CASTERS.filter(function (n) { return findObjs({ _type: 'character', name: n }).length; });
+            say('pong. build @@VERSION@@ - ' + Object.keys(SPELLS).length + ' spells in table; ' +
+                seen.length + '/' + CASTERS.length + ' casters found in this campaign.');
+            return;
+        }
+        if (arg === 'report') {
+            CASTERS.forEach(function (n) {
+                var ch = findObjs({ _type: 'character', name: n })[0];
+                if (!ch) { say(n + ': NOT FOUND'); return; }
+                var c = 0, unmatched = [];
+                findObjs({ _type: 'attribute', _characterid: ch.id }).forEach(function (a) {
+                    if (/^repeating_spell-(?:cantrip|[1-9])_-[A-Za-z0-9_-]+_spellname$/.test(a.get('name'))) {
+                        c++;
+                        if (!SPELLS[key(a.get('current'))]) unmatched.push(String(a.get('current')));
+                    }
+                });
+                say(n + ': ' + c + ' spell row(s)' + (unmatched.length ? ' - unmatched: ' + unmatched.join(', ') : ''));
+            });
+            return;
+        }
+        if (arg === 'test') { run([CASTERS[0]], 'Test'); return; }
+        if (arg === 'run')  { run(CASTERS, 'Spell data fill'); return; }
+        say('usage: !llspelldata ping | report | test | run');
+    });
+
+    log('LL_SpellData build @@VERSION@@ ready: ' + Object.keys(SPELLS).length +
+        ' spells, ' + CASTERS.length + ' casters.');
+});
