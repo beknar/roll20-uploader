@@ -306,3 +306,41 @@ def build_table(names, source_dir, aliases=None):
             fields['alt_evil_damagetype'] = row['alt_evil_damagetype']
         table[re.sub(r'[^a-z0-9]', '', name.lower())] = fields
     return table, missing
+
+_SCALE_LADDER = re.compile(r'\{@scale(?:damage|dice)\s+[^|]*\|([^|]*)\|([^}|]+)')
+
+
+def upcast_ladders(names, source_dir, aliases=None):
+    """Return {normalised name: [slot levels]} for spells that do NOT gain a die
+    at every level above their own.
+
+    5etools encodes the ladder as the middle field of {@scaledamage}: "1-9" for
+    the usual every-level case, "2,4,6,8" for Spiritual Weapon, which gains a die
+    every *two* levels. Only the exceptions are returned - callers can assume
+    own-level-to-9 for everything else.
+    """
+    aliases = dict(DEFAULT_ALIASES, **(aliases or {}))
+    idx = load_spells(source_dir)
+    out = {}
+    for name in names:
+        spell = idx.get(aliases.get(name.lower(), name.lower()))
+        if not spell:
+            continue
+        blob = json.dumps(spell.get('entries', [])) + json.dumps(spell.get('entriesHigherLevel', []))
+        m = _SCALE_LADDER.search(blob)
+        if not m:
+            continue
+        ladder, level = m.group(1).strip(), spell['level']
+        if ladder == '%d-9' % level:
+            continue
+        levels = []
+        for part in ladder.split(','):
+            part = part.strip()
+            if '-' in part:
+                lo, hi = part.split('-', 1)
+                levels.extend(range(int(lo), int(hi) + 1))
+            elif part.isdigit():
+                levels.append(int(part))
+        if levels:
+            out[re.sub(r'[^a-z0-9]', '', name.lower())] = sorted(set(levels))
+    return out

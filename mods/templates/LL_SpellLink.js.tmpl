@@ -1,0 +1,334 @@
+/* LL_SpellLink.js  --  @@LABEL@@
+ * Makes NPC spell rows actually roll.
+ *
+ * A spell row with spelloutput = ATTACK still posts a plain description card,
+ * because the sheet only builds the linked attack row when a row is edited in
+ * the sheet UI - the API cannot trigger that worker. This builds the same
+ * repeating_attack row the sheet would have built, and points the spell's
+ * rollcontent at it.
+ *
+ * The result matches a spell row that was set up by hand: attack roll or save
+ * DC, damage and type, a second damage line where the spell has one, healing,
+ * and the "Cast at what level?" prompt on upcastable spells.
+ *
+ * Build: @@VERSION@@
+ *
+ * Commands (GM only):
+ *   !llspelllink ping     - confirm it loaded
+ *   !llspelllink report   - what it would build, changes nothing
+ *   !llspelllink test     - one caster only
+ *   !llspelllink run      - all casters
+ *   !llspelllink revert   - unlink and delete the attack rows this script made
+ */
+on('ready', function () {
+    'use strict';
+
+    var CASTERS = @@CASTERS@@;
+    /* Spells that do NOT gain a die at every level above their own. Spiritual
+       Weapon gains one every TWO levels, so its ladder is [2,4,6,8]. Anything
+       absent here is assumed to step at every level. */
+    var LADDERS = @@LADDERS@@;
+    var ABIL = { str: 'strength', dex: 'dexterity', con: 'constitution',
+                 int: 'intelligence', wis: 'wisdom', cha: 'charisma' };
+
+    function say(m) {
+        var safe = String(m).replace(/@\{/g, '(at){').replace(/\[\[/g, '[(')
+                            .replace(/\]\]/g, ')]').replace(/\{\{/g, '{(')
+                            .replace(/\}\}/g, ')}');
+        try { sendChat('@@LABEL@@', '/w gm ' + safe); }
+        catch (e) { log('sendChat failed: ' + e.message + ' || ' + safe); }
+    }
+
+    /* Roll20's generateRowID is not exposed to mods, so reimplement it.
+       Row ids never contain an underscore - the real one swaps them for dashes. */
+    var ROWCHARS = '-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz';
+    var usedRows = {};
+    function rowID() {
+        var ts = (new Date()).getTime(), id = '', i;
+        for (i = 0; i < 8; i++) { id = ROWCHARS[ts % 64] + id; ts = Math.floor(ts / 64); }
+        for (i = 0; i < 12; i++) id += ROWCHARS[Math.floor(Math.random() * 64)];
+        return id.replace(/_/g, '-');
+    }
+    function uniqueRowID() {
+        for (var i = 0; i < 60; i++) {
+            var id = rowID();
+            if (!usedRows[id]) { usedRows[id] = 1; return id; }
+        }
+        return rowID();
+    }
+
+    function attrMap(charid) {
+        var m = {};
+        findObjs({ _type: 'attribute', _characterid: charid }).forEach(function (a) {
+            m[a.get('name')] = a;
+        });
+        return m;
+    }
+    function setAttr(charid, map, name, value) {
+        var a = map[name];
+        if (a) { if (String(a.get('current')) !== String(value)) a.set('current', value); return; }
+        map[name] = createObj('attribute', {
+            _characterid: charid, name: name, current: value, max: ''
+        });
+    }
+    function val(map, n) { return map[n] ? String(map[n].get('current')) : ''; }
+
+    function spellRows(map) {
+        var rows = {};
+        Object.keys(map).forEach(function (k) {
+            var m = k.match(/^repeating_(spell-(?:cantrip|[1-9]))_(-[A-Za-z0-9-]+)_(.+)$/);
+            if (!m) return;
+            var key = m[1] + '|' + m[2];
+            rows[key] = rows[key] || { sec: m[1], rid: m[2] };
+            rows[key][m[3]] = String(map[k].get('current'));
+        });
+        return rows;
+    }
+
+    /* "{{hldmg=[[(1*?{Cast at what level?|Level 3,0|...|Level 9,6})d6]]}}"
+       - one extra die per slot level above the spell's own level. */
+    function key(n) { return String(n || '').toLowerCase().replace(/[^a-z0-9]/g, ''); }
+
+    function upcast(r) {
+        var lvl = parseInt(r.spelllevel, 10);
+        if (!r.spellhldie || !r.spellhldietype || !lvl || lvl < 1 || lvl > 8) return '';
+        var ladder = LADDERS[key(r.spellname)];
+        var opts = [], i;
+        for (i = lvl; i <= 9; i++) {
+            var mult;
+            if (ladder) {
+                /* one extra die per ladder step reached, so 5th level on a
+                   [2,4,6,8] ladder is still +1 die, not +3 */
+                mult = 0;
+                for (var j = 0; j < ladder.length; j++) if (ladder[j] <= i) mult++;
+                mult = Math.max(0, mult - 1);
+            } else {
+                mult = i - lvl;
+            }
+            opts.push('Level ' + i + ',' + mult);
+        }
+        return '{{hldmg=[[(' + r.spellhldie + '*?{Cast at what level?|' +
+               opts.join('|') + '})' + r.spellhldietype + ']]}}';
+    }
+    function upcastCrit(r) {
+        var h = upcast(r);
+        return h ? h.replace('{{hldmg=', '{{hldmgcrit=') : '';
+    }
+
+    function build(ch, map, r) {
+        var isAtk = (r.spellattack === 'Ranged' || r.spellattack === 'Melee');
+        var abKey = val(map, 'spellcasting_ability').toLowerCase().replace(/[^a-z]/g, '').slice(0, 3);
+        var abMod = ABIL[abKey] ? '@{' + ABIL[abKey] + '_mod}' : '';
+        var bonus = val(map, 'spell_attack_bonus') || '0';
+        var dc = val(map, 'spell_save_dc') || '';
+
+        var d1 = r.spellhealing || r.spelldamage || '';
+        var t1 = r.spellhealing ? 'Healing' : (r.spelldamagetype || '');
+        if (d1 && r.spelldmgmod === 'Yes' && abMod) d1 = d1 + '+' + abMod;
+        var d2 = r.spelldamage2 || '';
+        var t2 = r.spelldamagetype2 || '';
+
+        var atkbonus = isAtk ? ('+' + String(bonus).replace(/^\+/, ''))
+                             : (r.spellsave && dc ? 'DC' + dc : '');
+        var atkflag = isAtk ? '{{attack=1}}' : '0';
+        var dmgflag = d1 ? '{{damage=1}} {{dmg1flag=1}}' : '0';
+        var dmg2flag = d2 ? '{{damage=1}} {{dmg2flag=1}}' : '0';
+        var saveflag = (r.spellsave && dc)
+            ? '{{save=1}} {{saveattr=@{saveattr}}} {{savedesc=@{saveeffect}}} {{savedc=[[[[@{savedc}]][SAVE]]]}}'
+            : '0';
+
+        var r1, r2;
+        if (isAtk) {
+            r1 = '{{r1=[[@{d20}cs>@{atkcritrange} + ' + String(bonus).replace(/^\+/, '') + ']]}}';
+            r2 = '@{rtype}cs>@{atkcritrange} + ' + String(bonus).replace(/^\+/, '') + ']]}}';
+        } else {
+            r1 = '{{r1=[[0d20cs>@{atkcritrange}]]}}';
+            r2 = '{{r2=[[0d20cs>@{atkcritrange}]]}}';
+        }
+
+        var D1 = d1 || '0', D2 = d2 || '0';
+        var hl = upcast(r), hlc = upcastCrit(r);
+        var link = '{{spelldesc_link=[Show Spell Description](~repeating_attack_spelldesc_link)}}';
+
+        var rollbase = '@{wtype}&{template:atkdmg} {{mod=@{atkbonus}}} {{rname=@{atkname}}} ' +
+            r1 + ' ' + r2 + ' @{atkflag} {{range=@{atkrange}}} @{dmgflag}' +
+            ' {{dmg1=[[' + D1 + ']]}} {{dmg1type=' + t1 + '}} @{dmg2flag}' +
+            ' {{dmg2=[[' + D2 + ']]}} {{dmg2type=' + t2 + '}}' +
+            ' {{crit1=[[' + D1 + '[CRIT]]]}} {{crit2=[[' + D2 + '[CRIT]]]}}' +
+            ' @{saveflag} {{desc=@{atk_desc}}} ' + hl + (hlc ? ' ' + hlc : '') +
+            ' {{spelllevel=@{spelllevel}}} {{innate=@{spell_innate}}}' +
+            ' {{globalattack=@{global_attack_mod}}} {{globaldamage=[[0]]}}' +
+            ' {{globaldamagecrit=[[0]]}} {{globaldamagetype=@{global_damage_mod_type}}}' +
+            ' ammo=@{ammo} ' + link + ' @{charname_output}';
+
+        var rollbase_dmg = '@{wtype}&{template:dmg} {{rname=@{atkname}}} @{atkflag}' +
+            ' {{range=@{atkrange}}} @{dmgflag} {{dmg1=[[' + D1 + ']]}} {{dmg1type=' + t1 + '}}' +
+            ' @{dmg2flag} {{dmg2=[[' + D2 + ']]}} {{dmg2type=' + t2 + '}} @{saveflag}' +
+            ' {{desc=@{atk_desc}}} ' + hl + ' {{spelllevel=@{spelllevel}}}' +
+            ' {{innate=@{spell_innate}}} {{globaldamage=[[0]]}}' +
+            ' {{globaldamagetype=@{global_damage_mod_type}}} ' + link + ' @{charname_output}';
+
+        var rollbase_crit = '@{wtype}&{template:dmg} {{crit=1}} {{rname=@{atkname}}} @{atkflag}' +
+            ' {{range=@{atkrange}}} @{dmgflag} {{dmg1=[[' + D1 + ']]}} {{dmg1type=' + t1 + '}}' +
+            ' @{dmg2flag} {{dmg2=[[' + D2 + ']]}} {{dmg2type=' + t2 + '}}' +
+            ' {{crit1=[[' + D1 + ']]}} {{crit2=[[' + D2 + ']]}} @{saveflag}' +
+            ' {{desc=@{atk_desc}}} ' + hl + (hlc ? ' ' + hlc : '') +
+            ' {{spelllevel=@{spelllevel}}} {{innate=@{spell_innate}}} {{globaldamage=[[0]]}}' +
+            ' {{globaldamagecrit=[[0]]}} {{globaldamagetype=@{global_damage_mod_type}}} ' +
+            link + ' @{charname_output}';
+
+        return {
+            atkname: r.spellname,
+            atkbonus: atkbonus,
+            atkflag: atkflag,
+            atkrange: r.spellrange || '',
+            atkattr_base: abMod || '0',
+            atkdmgtype: (d1 ? d1 + ' ' + t1 : ''),
+            atk_desc: '',
+            dmgbase: d1, dmgtype: t1, dmgattr: '0', dmgflag: dmgflag,
+            dmg2base: d2, dmg2type: t2, dmg2attr: '0', dmg2flag: dmg2flag,
+            hldmg: hl,
+            savedc: dc || '0',
+            saveattr: r.spellsave || '',
+            saveeffect: r.spellsavesuccess || '',
+            saveflag: saveflag,
+            /* the sheet stores the plain level here ('3', 'cantrip'), not an ordinal */
+            spelllevel: r.spelllevel || '',
+            spell_innate: r.innate || '',
+            spellid: r.rid.toLowerCase(),
+            spelldesc_link: '%{' + ch.id + '|repeating_' + r.sec + '_' + r.rid.toLowerCase() + '_output}',
+            'options-flag': '0',
+            rollbase: rollbase,
+            rollbase_dmg: rollbase_dmg,
+            rollbase_crit: rollbase_crit
+        };
+    }
+
+    function doCaster(ch, stats) {
+        var map = attrMap(ch.id);
+        var rows = spellRows(map);
+
+        /* attack rows this script already made, keyed by the spell row they serve */
+        var existing = {};
+        Object.keys(map).forEach(function (k) {
+            var m = k.match(/^repeating_attack_(-[A-Za-z0-9-]+)_spellid$/);
+            if (m) existing[String(map[k].get('current')).toLowerCase()] = m[1];
+        });
+
+        var made = 0, upd = 0, skipped = 0;
+        Object.keys(rows).forEach(function (key) {
+            var r = rows[key];
+            if (!r.spellname) return;
+            if (r.spelloutput !== 'ATTACK') { skipped++; return; }
+
+            var fields = build(ch, map, r);
+            var aid = existing[r.rid.toLowerCase()];
+            if (aid) { upd++; } else { aid = uniqueRowID(); made++; }
+
+            var pre = 'repeating_attack_' + aid + '_';
+            Object.keys(fields).forEach(function (f) { setAttr(ch.id, map, pre + f, fields[f]); });
+
+            /* point the spell row at it */
+            var spre = 'repeating_' + r.sec + '_' + r.rid + '_';
+            setAttr(ch.id, map, spre + 'spellattackid', aid);
+            setAttr(ch.id, map, spre + 'rollcontent',
+                    '%{' + ch.id + '|repeating_attack_' + aid.toLowerCase() + '_attack}');
+        });
+
+        stats.made += made; stats.upd += upd;
+        return ch.get('name') + ': ' + made + ' linked, ' + upd + ' refreshed, ' +
+               skipped + ' left as cards';
+    }
+
+    function run(list, label) {
+        var stats = { made: 0, upd: 0 }, lines = [], i = 0;
+        function step() {
+            if (i >= list.length) {
+                say('<b>' + label + ' complete.</b> ' + stats.made + ' spell(s) linked, ' +
+                    stats.upd + ' refreshed.');
+                lines.forEach(function (l) { say(l); });
+                return;
+            }
+            var ch = findObjs({ _type: 'character', name: list[i++] })[0];
+            if (ch) {
+                try { lines.push(doCaster(ch, stats)); }
+                catch (e) { lines.push(ch.get('name') + ': ERROR ' + e.message); }
+            }
+            setTimeout(step, 150);
+        }
+        step();
+    }
+
+    on('chat:message', function (msg) {
+        if (msg.type !== 'api' || !/^!llspelllink\b/i.test(msg.content)) return;
+        if (!playerIsGM(msg.playerid)) return;
+        var arg = (msg.content.split(/\s+/)[1] || 'help').toLowerCase();
+
+        if (arg === 'ping') {
+            var lk = Object.keys(LADDERS);
+            say('pong. build @@VERSION@@ - watching ' + CASTERS.length + ' caster(s), ' +
+                lk.length + ' upcast ladder override(s)' + (lk.length ? ': ' + lk.join(', ') : '') + '.');
+            return;
+        }
+        if (arg === 'report') {
+            var tot = 0, up = 0;
+            CASTERS.forEach(function (n) {
+                var ch = findObjs({ _type: 'character', name: n })[0];
+                if (!ch) { say(n + ': NOT FOUND'); return; }
+                var map = attrMap(ch.id), rows = spellRows(map);
+                var atk = [], ups = [];
+                Object.keys(rows).forEach(function (k) {
+                    var r = rows[k];
+                    if (r.spellname && r.spelloutput === 'ATTACK') {
+                        atk.push(r.spellname);
+                        if (upcast(r)) ups.push(r.spellname);
+                    }
+                });
+                if (!atk.length) return;
+                tot += atk.length; up += ups.length;
+                say(n + ': ' + atk.length + ' to link' +
+                    (ups.length ? ' (' + ups.length + ' will prompt for level: ' + ups.join(', ') + ')' : ''));
+            });
+            say('<b>Total:</b> ' + tot + ' spell(s), ' + up + ' with a level prompt. Nothing changed.');
+            return;
+        }
+        if (arg === 'revert') {
+            var gone = 0;
+            CASTERS.forEach(function (n) {
+                var ch = findObjs({ _type: 'character', name: n })[0];
+                if (!ch) return;
+                var map = attrMap(ch.id);
+                var ours = {};
+                Object.keys(map).forEach(function (k) {
+                    var m = k.match(/^repeating_attack_(-[A-Za-z0-9-]+)_spellid$/);
+                    if (m && String(map[k].get('current'))) ours[m[1]] = 1;
+                });
+                Object.keys(map).forEach(function (k) {
+                    var m = k.match(/^repeating_attack_(-[A-Za-z0-9-]+)_/);
+                    if (m && ours[m[1]]) { map[k].remove(); gone++; }
+                    var s = k.match(/^repeating_(spell-(?:cantrip|[1-9]))_(-[A-Za-z0-9-]+)_(rollcontent|spellattackid)$/);
+                    if (s) { map[k].remove(); }
+                });
+            });
+            say('removed ' + gone + ' attack-row attribute(s) and unlinked the spell rows.');
+            return;
+        }
+        if (arg === 'test') {
+            var pick = null;
+            for (var t = 0; t < CASTERS.length && !pick; t++) {
+                var cc = findObjs({ _type: 'character', name: CASTERS[t] })[0];
+                if (!cc) continue;
+                var rr = spellRows(attrMap(cc.id));
+                if (Object.keys(rr).some(function (k) { return rr[k].spelloutput === 'ATTACK'; })) pick = CASTERS[t];
+            }
+            if (!pick) { say('no caster has an ATTACK spell row.'); return; }
+            say('testing on ' + pick + '.');
+            run([pick], 'Test');
+            return;
+        }
+        if (arg === 'run') { run(CASTERS, 'Spell link'); return; }
+        say('usage: !llspelllink ping | report | test | run | revert');
+    });
+
+    log('LL_SpellLink build @@VERSION@@ ready: ' + CASTERS.length + ' casters.');
+});

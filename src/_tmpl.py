@@ -23,10 +23,27 @@ def render_map(template, mapping, out_name):
     js = src.replace("@@LABEL@@", CFG["campaign_label"])
     for key, value in mapping.items():
         js = js.replace(f"@@{key}@@", value)
-    left = [m for m in ("@@DATA@@", "@@CASTERS@@", "@@INNATE@@", "@@FIELDS@@", "@@VERSION@@") if m in js]
+    left = [m for m in ("@@DATA@@", "@@CASTERS@@", "@@INNATE@@", "@@FIELDS@@", "@@VERSION@@", "@@LADDERS@@") if m in js]
     if left:
         raise SystemExit(f"{template}: unfilled marker(s) {', '.join(left)}")
     path = out_path(out_name)
     open(path, "w", encoding="utf-8").write(js)
     print(f"{out_name}: {len(js)/1024:.0f} KB -> {path}")
     return path
+
+
+def content_stamp(template, mapping):
+    """A short hash of what a build will actually contain.
+
+    Hashes the template plus every value going into it, so two builds are only
+    ever stamped the same when the generated script is the same. A version taken
+    from config alone cannot do that: edit the template, rebuild, and you get a
+    second file claiming to be the same version as the first.
+    """
+    import hashlib
+    src = open(os.path.join(REPO, "mods", "templates", template), encoding="utf-8").read()
+    h = hashlib.sha256(src.encode("utf-8"))
+    for key in sorted(mapping):
+        h.update(key.encode("utf-8"))
+        h.update(str(mapping[key]).encode("utf-8"))
+    return h.hexdigest()[:7]
