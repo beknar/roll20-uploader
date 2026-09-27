@@ -57,7 +57,7 @@ def caster_rows(npc):
               if 'astin' in t.get("name", "") or 'Innate' in t.get("name", "")]
     if not traits:
         return None, []
-    text = ' '.join(t.get("desc", "") for t in traits)
+    text = '. '.join(t.get("desc", "").rstrip(' .') for t in traits)
     dc = DC.search(text)
     atk = re.search(r'\+(\d+)\s*(?:to hit|\))', text)
     ab = ABL.search(text)
