@@ -51,7 +51,9 @@ on('ready', function () {
         return 1;
     }
 
-    function doCaster(ch, stats) {
+    var ROWS_PER_TICK = 3;
+
+    function doCaster(ch, stats, cb) {
         var id = ch.id, nm = ch.get('name');
         var map = attrMap(id);
 
@@ -70,7 +72,11 @@ on('ready', function () {
         });
 
         var done = 0, miss = [];
-        Object.keys(rows).forEach(function (rk) {
+        /* Rows are filled a few at a time across timer ticks. A large caster
+           (30+ rows x ~25 fields) done in one tick trips the sandbox's
+           "possible infinite loop" watchdog and kills every script. */
+        var keys = Object.keys(rows), ki = 0;
+        function fillRow(rk) {
             var row = rows[rk];
             var sp = SPELLS[key(row.name)];
             if (!sp) { miss.push(row.name); return; }
@@ -88,11 +94,17 @@ on('ready', function () {
             setAttr(id, map, pre + 'innate', innateVal);
             if (sp.spelllevel !== 'cantrip') setAttr(id, map, pre + 'spellprepared', '1');
             done++;
-        });
-
-        stats.rows += done;
-        stats.missing = stats.missing.concat(miss);
-        return nm + ': ' + done + ' row(s)' + (miss.length ? ', UNMATCHED: ' + miss.join(', ') : '');
+        }
+        function chunk() {
+            try {
+                for (var n = 0; n < ROWS_PER_TICK && ki < keys.length; n++) fillRow(keys[ki++]);
+            } catch (e) { cb(nm + ': ERROR ' + e.message); return; }
+            if (ki < keys.length) { setTimeout(chunk, 150); return; }
+            stats.rows += done;
+            stats.missing = stats.missing.concat(miss);
+            cb(nm + ': ' + done + ' row(s)' + (miss.length ? ', UNMATCHED: ' + miss.join(', ') : ''));
+        }
+        chunk();
     }
 
     function run(list, label) {
@@ -112,9 +124,8 @@ on('ready', function () {
             var nm = list[i++];
             var ch = findObjs({ _type: 'character', name: nm })[0];
             if (!ch) { lines.push(nm + ': CHARACTER NOT FOUND'); setTimeout(step, 60); return; }
-            try { lines.push(doCaster(ch, stats)); }
-            catch (e) { lines.push(nm + ': ERROR ' + e.message); }
-            setTimeout(step, 120);
+            try { doCaster(ch, stats, function (line) { lines.push(line); setTimeout(step, 120); }); }
+            catch (e) { lines.push(nm + ': ERROR ' + e.message); setTimeout(step, 120); }
         }
         step();
     }
